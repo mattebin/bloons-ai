@@ -13,6 +13,7 @@ Includes:
 - Dry-run visualization markers in ARMED mode
 """
 
+import argparse
 import cv2
 import json
 import numpy as np
@@ -128,6 +129,9 @@ STAGE_COOLDOWN = {
 }
 CLICK_RETRIES = 2
 CLICK_RETRY_DELAY = 0.12
+FOCUS_DELAY = 0.08
+KEY_DELAY = 0.05
+CLICK_DELAY = 0.08
 HEARTBEAT_INTERVAL = 0.50
 DRIFT_CHECK_INTERVAL = 5.0
 
@@ -384,36 +388,43 @@ def focus_window(win_id):
 # ======================
 
 
-def do_click(x, y, tower_name=None):
+def do_click(x, y, tower_name=None, retries=1):
     """Focus game, optionally send tower hotkey, click, then refocus shadow.
-       Always sends Escape after placement attempts to avoid held-tower state.
-       Never raises (returns True/False)."""
+    Always sends Escape after placement attempts to avoid held-tower state.
+    Never raises (returns True/False).
+    """
     global BTD6_WIN
     if BTD6_WIN is None:
         log("CLICK: BTD6_WIN not set")
         return False
 
-    ok = True
-    try:
-        subprocess.run(["xdotool", "windowactivate", "--sync", str(BTD6_WIN)], check=False)
-        time.sleep(FOCUS_DELAY)
-        if tower_name is not None:
-            subprocess.run(["xdotool", "key", "--window", str(BTD6_WIN), tower_name], check=False)
-            time.sleep(KEY_DELAY)
-        subprocess.run(["xdotool", "mousemove", "--window", str(BTD6_WIN), str(int(x)), str(int(y))], check=False)
-        subprocess.run(["xdotool", "click", "--window", str(BTD6_WIN), "1"], check=False)
-        time.sleep(CLICK_DELAY)
-    except Exception as e:
-        ok = False
-        log(f"CLICK ERROR: {e}")
-    finally:
-        if tower_name is not None:
-            try:
-                subprocess.run(["xdotool", "key", "--window", str(BTD6_WIN), "Escape"], check=False)
-            except Exception:
-                pass
-        refocus_shadow()
-    return ok
+    attempt = 0
+    while attempt < max(1, retries):
+        attempt += 1
+        ok = True
+        try:
+            subprocess.run(["xdotool", "windowactivate", "--sync", str(BTD6_WIN)], check=False)
+            time.sleep(FOCUS_DELAY)
+            if tower_name is not None:
+                subprocess.run(["xdotool", "key", "--window", str(BTD6_WIN), tower_name], check=False)
+                time.sleep(KEY_DELAY)
+            subprocess.run(["xdotool", "mousemove", "--window", str(BTD6_WIN), str(int(x)), str(int(y))], check=False)
+            subprocess.run(["xdotool", "click", "--window", str(BTD6_WIN), "1"], check=False)
+            time.sleep(CLICK_DELAY)
+        except Exception as e:
+            ok = False
+            log(f"CLICK ERROR: {e}")
+        finally:
+            if tower_name is not None:
+                try:
+                    subprocess.run(["xdotool", "key", "--window", str(BTD6_WIN), "Escape"], check=False)
+                except Exception:
+                    pass
+            refocus_shadow()
+        if ok:
+            return True
+        time.sleep(CLICK_RETRY_DELAY)
+    return False
 def click_upgrade_path(path_id, retries=CLICK_RETRIES):
     """Click upgrade path button.
     Prefer desktop-calibrated UI coords if present (works even if S is playfield-only),
@@ -456,6 +467,15 @@ def save_ui_desktop():
     _safe_json_save(CFG / "ui_desktop.json", UI_DESKTOP)
     _safe_json_save(LEGACY_UI_DESKTOP_FILE, UI_DESKTOP)
     log(f"Saved UI_DESKTOP -> {CFG / 'ui_desktop.json'}")
+
+
+def ensure_dependencies():
+    """Return list of missing external dependencies."""
+    missing = []
+    for cmd in ("xdotool",):
+        if shutil.which(cmd) is None:
+            missing.append(cmd)
+    return missing
 
 
 # ======================
@@ -750,7 +770,7 @@ def set_auto_state(new_state):
 
 def plan_next_action():
     """Pick next action; returns action dict or None."""
-    if H is None:
+    if H is None or S is None:
         return None
     act = pick_action_simple()
 
@@ -910,10 +930,25 @@ def main():
     global SHADOW_WIN, BTD6_WIN, EXPECTED_BTD6_WMCLASS, H, S
     global auto_state, last_act_ts, last_heartbeat_ts, last_drift_check_ts, last_reason, armed_marker
     global blocked_edit_mode, _current_poly
+    global CAM_INDEX
+
+    parser = argparse.ArgumentParser(description="BTD6 Shadow Player automation.")
+    parser.add_argument("--profile", default=None, help="Profile name to load from ~/.config/btd6-ai/profiles")
+    parser.add_argument("--camera-index", type=int, default=CAM_INDEX, help="OBS Virtual Camera index")
+    args = parser.parse_args()
 
     # Ensure default profile exists and load
     profs = list_profiles()
-    set_profile(profs[0] if profs else DEFAULT_PROFILE)
+    if args.profile:
+        set_profile(args.profile)
+    else:
+        set_profile(profs[0] if profs else DEFAULT_PROFILE)
+
+    CAM_INDEX = args.camera_index
+
+    missing = ensure_dependencies()
+    if missing:
+        raise SystemExit(f"ERROR: missing dependencies: {', '.join(missing)}")
 
     # Capture
     cap = cv2.VideoCapture(CAM_INDEX)
